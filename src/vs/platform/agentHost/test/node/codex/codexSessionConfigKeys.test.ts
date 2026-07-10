@@ -6,7 +6,7 @@
 import assert from 'assert';
 import type { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { CodexSessionConfigKey, collaborationModeKind, narrowAdditionalDirectories, narrowApprovalPolicy, narrowBoolean, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowSandboxMode, narrowWebSearchMode } from '../../../node/codex/codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, collaborationModeKind, narrowAdditionalDirectories, narrowApprovalPolicy, narrowBoolean, narrowCodexPermissionsPreset, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowSandboxMode, narrowWebSearchMode, resolveCodexPermissions, resolveCodexPermissionsPreset } from '../../../node/codex/codexSessionConfigKeys.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
@@ -38,6 +38,7 @@ suite('codexSessionConfigKeys', () => {
 		assert.deepStrictEqual({
 			approvalPolicy: [narrowApprovalPolicy('never'), narrowApprovalPolicy('on-request'), narrowApprovalPolicy('nope')],
 			sandboxMode: [narrowSandboxMode('read-only'), narrowSandboxMode('workspace-write'), narrowSandboxMode('folder')],
+			permissionsPreset: [narrowCodexPermissionsPreset('default'), narrowCodexPermissionsPreset('full-access'), narrowCodexPermissionsPreset('yolo')],
 			additionalDirectories: [narrowAdditionalDirectories(['/tmp/a', '', 1, '/tmp/b']), narrowAdditionalDirectories('nope')],
 			boolean: [narrowBoolean(true), narrowBoolean(false), narrowBoolean('true')],
 			webSearchMode: [narrowWebSearchMode('disabled'), narrowWebSearchMode('cached'), narrowWebSearchMode('online')],
@@ -48,6 +49,7 @@ suite('codexSessionConfigKeys', () => {
 		}, {
 			approvalPolicy: ['never', 'on-request', undefined],
 			sandboxMode: ['read-only', 'workspace-write', undefined],
+			permissionsPreset: ['default', 'full-access', undefined],
 			additionalDirectories: [['/tmp/a', '/tmp/b'], undefined],
 			boolean: [true, false, undefined],
 			webSearchMode: ['disabled', 'cached', undefined],
@@ -58,55 +60,55 @@ suite('codexSessionConfigKeys', () => {
 		});
 	});
 
-	test('resolveSessionConfig scopes Codex-specific config properties', async () => {
+	test('expands permissions presets and falls back to legacy axes', () => {
+		const legacyDefaults = { approvalPolicy: 'on-request' as const, sandboxMode: 'workspace-write' as const };
+		assert.deepStrictEqual({
+			presets: {
+				default: resolveCodexPermissionsPreset('default'),
+				autoReview: resolveCodexPermissionsPreset('auto-review'),
+				fullAccess: resolveCodexPermissionsPreset('full-access'),
+			},
+			// A stored preset is the source of truth and expands to all three axes.
+			fromPreset: resolveCodexPermissions({ [CodexSessionConfigKey.PermissionsPreset]: 'full-access' }, legacyDefaults),
+			// Without a preset, legacy per-axis keys are honored with a `user` reviewer.
+			fromLegacyKeys: resolveCodexPermissions({ [CodexSessionConfigKey.SandboxMode]: 'read-only', [CodexSessionConfigKey.ApprovalPolicy]: 'never' }, legacyDefaults),
+			// Empty config falls back entirely to the provided defaults.
+			fromDefaults: resolveCodexPermissions(undefined, legacyDefaults),
+		}, {
+			presets: {
+				default: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'user' },
+				autoReview: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'auto_review' },
+				fullAccess: { approvalPolicy: 'never', sandboxMode: 'danger-full-access', approvalsReviewer: 'user' },
+			},
+			fromPreset: { approvalPolicy: 'never', sandboxMode: 'danger-full-access', approvalsReviewer: 'user' },
+			fromLegacyKeys: { approvalPolicy: 'never', sandboxMode: 'read-only', approvalsReviewer: 'user' },
+			fromDefaults: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'user' },
+		});
+	});
+
+	test('resolveSessionConfig exposes a single permissions-preset chip', async () => {
 		const agent = createAgent(disposables);
 
-		const readOnly = await agent.resolveSessionConfig({ config: { [CodexSessionConfigKey.SandboxMode]: 'read-only' } });
-		const workspaceWrite = await agent.resolveSessionConfig({ config: { [CodexSessionConfigKey.SandboxMode]: 'workspace-write' } });
+		const defaulted = await agent.resolveSessionConfig({ config: {} });
+		const fullAccess = await agent.resolveSessionConfig({ config: { [CodexSessionConfigKey.PermissionsPreset]: 'full-access' } });
 
 		assert.deepStrictEqual({
-			readOnlyProperties: Object.keys(readOnly.schema.properties).filter(key => key.startsWith('codex.')).sort(),
-			readOnlyMode: readOnly.values[SessionConfigKey.Mode],
-			readOnlyValues: {
-				[CodexSessionConfigKey.ApprovalPolicy]: readOnly.values[CodexSessionConfigKey.ApprovalPolicy],
-				[CodexSessionConfigKey.SandboxMode]: readOnly.values[CodexSessionConfigKey.SandboxMode],
-				[CodexSessionConfigKey.WebSearchMode]: readOnly.values[CodexSessionConfigKey.WebSearchMode],
-				[CodexSessionConfigKey.Personality]: readOnly.values[CodexSessionConfigKey.Personality],
-				[CodexSessionConfigKey.ReasoningSummary]: readOnly.values[CodexSessionConfigKey.ReasoningSummary],
+			// The visible schema is reduced to Mode + one permissions preset + Permissions.
+			schemaProperties: Object.keys(defaulted.schema.properties).sort(),
+			// Codex drops "Autopilot" (no native equivalent — it would duplicate
+			// "Interactive"), so the Mode picker offers only interactive + plan.
+			modeEnum: defaulted.schema.properties[SessionConfigKey.Mode].enum,
+			defaultedValues: {
+				mode: defaulted.values[SessionConfigKey.Mode],
+				preset: defaulted.values[CodexSessionConfigKey.PermissionsPreset],
 			},
-			workspaceWriteProperties: Object.keys(workspaceWrite.schema.properties).filter(key => key.startsWith('codex.')).sort(),
-			workspaceWriteValues: {
-				additionalDirectories: workspaceWrite.values[CodexSessionConfigKey.AdditionalDirectories],
-				networkAccessEnabled: workspaceWrite.values[CodexSessionConfigKey.NetworkAccessEnabled],
-			},
+			// The preset is session-mutable and echoed back unchanged.
+			fullAccessPreset: fullAccess.values[CodexSessionConfigKey.PermissionsPreset],
 		}, {
-			readOnlyProperties: [
-				CodexSessionConfigKey.ApprovalPolicy,
-				CodexSessionConfigKey.SandboxMode,
-				CodexSessionConfigKey.WebSearchMode,
-				CodexSessionConfigKey.Personality,
-				CodexSessionConfigKey.ReasoningSummary,
-			].sort(),
-			readOnlyMode: 'interactive',
-			readOnlyValues: {
-				[CodexSessionConfigKey.ApprovalPolicy]: 'on-request',
-				[CodexSessionConfigKey.SandboxMode]: 'read-only',
-				[CodexSessionConfigKey.WebSearchMode]: 'disabled',
-				[CodexSessionConfigKey.Personality]: 'none',
-				[CodexSessionConfigKey.ReasoningSummary]: 'auto',
-			},
-			workspaceWriteProperties: [
-				CodexSessionConfigKey.ApprovalPolicy,
-				CodexSessionConfigKey.NetworkAccessEnabled,
-				CodexSessionConfigKey.SandboxMode,
-				CodexSessionConfigKey.WebSearchMode,
-				CodexSessionConfigKey.Personality,
-				CodexSessionConfigKey.ReasoningSummary,
-			].sort(),
-			workspaceWriteValues: {
-				additionalDirectories: undefined,
-				networkAccessEnabled: false,
-			},
+			schemaProperties: [SessionConfigKey.Mode, CodexSessionConfigKey.PermissionsPreset, SessionConfigKey.Permissions].sort(),
+			modeEnum: ['interactive', 'plan'],
+			defaultedValues: { mode: 'interactive', preset: 'default' },
+			fullAccessPreset: 'full-access',
 		});
 	});
 });

@@ -220,6 +220,44 @@ suite('codexMapAppServerEvents', () => {
 		assert.deepStrictEqual((start as { _meta?: Record<string, unknown> })._meta, { toolKind: 'terminal' });
 	});
 
+	test('commandExecution unwraps the OS shell wrapper for display (start + completed)', () => {
+		const state = createCodexSessionMapState();
+		const started = mapItemStarted(state, {
+			item: {
+				type: 'commandExecution', id: 'cmd_wrap',
+				command: '/bin/zsh -lc \'touch ~/foo\'', cwd: '/tmp', processId: null,
+				source: 'agent' as never, status: 'inProgress' as never,
+				commandActions: [], aggregatedOutput: null,
+				exitCode: null, durationMs: null,
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const delta = started[1] as { content: string };
+		const ready = started[2] as { invocationMessage: string; toolInput: string };
+		const completed = mapItemCompleted(state, {
+			item: {
+				type: 'commandExecution', id: 'cmd_wrap',
+				command: '/bin/zsh -lc \'touch ~/foo\'', cwd: '/tmp', processId: null,
+				source: 'agent' as never, status: 'completed' as never,
+				commandActions: [], aggregatedOutput: '',
+				exitCode: 0, durationMs: 4,
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
+		});
+		const complete = completed[0] as { result: { pastTenseMessage: string } };
+		assert.deepStrictEqual({
+			delta: delta.content,
+			invocationMessage: ready.invocationMessage,
+			toolInput: ready.toolInput,
+			pastTenseMessage: complete.result.pastTenseMessage,
+		}, {
+			delta: 'touch ~/foo',
+			invocationMessage: 'touch ~/foo',
+			toolInput: 'touch ~/foo',
+			pastTenseMessage: 'Ran `touch ~/foo`',
+		});
+	});
+
 	test('item/commandExecution/outputDelta streams running tool content', () => {
 		const state = createCodexSessionMapState();
 		mapItemStarted(state, {
@@ -501,6 +539,130 @@ suite('codexMapAppServerEvents', () => {
 		}
 		assert.strictEqual(complete.result.success, false);
 		assert.strictEqual(complete.result.error?.code, 'denied');
+	});
+
+	test('collabAgentToolCall spawnAgent start emits tool-call lifecycle carrying the prompt and model', () => {
+		const state = createCodexSessionMapState();
+		const startActions = mapItemStarted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_1', tool: 'spawnAgent',
+				status: 'inProgress', senderThreadId: 'thr_1', receiverThreadIds: [],
+				prompt: 'Investigate the failing test', model: 'gpt-5.5',
+				reasoningEffort: null, agentsStates: {},
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const toolCallId = state.itemToToolCall.get('collab_1')!.toolCallId;
+		assert.deepStrictEqual({
+			actions: startActions,
+			entryToolName: state.itemToToolCall.get('collab_1')!.toolName,
+		}, {
+			actions: [
+				{ type: ActionType.ChatToolCallStart, turnId: 'turn_a', toolCallId, toolName: 'codex.spawnAgent', displayName: 'Spawn agent' },
+				{ type: ActionType.ChatToolCallDelta, turnId: 'turn_a', toolCallId, content: 'Investigate the failing test\n\nModel: gpt-5.5' },
+				{ type: ActionType.ChatToolCallReady, turnId: 'turn_a', toolCallId, invocationMessage: 'Spawning agent', toolInput: 'Investigate the failing test\n\nModel: gpt-5.5', confirmed: ToolCallConfirmationReason.NotNeeded },
+			],
+			entryToolName: 'codex.spawnAgent',
+		});
+	});
+
+	test('collabAgentToolCall spawnAgent completed renders the subagent result as tool output', () => {
+		const state = createCodexSessionMapState();
+		mapItemStarted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_2', tool: 'spawnAgent',
+				status: 'inProgress', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1'],
+				prompt: 'Investigate the failing test', model: 'gpt-5.5',
+				reasoningEffort: null, agentsStates: {},
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const toolCallId = state.itemToToolCall.get('collab_2')!.toolCallId;
+		const actions = mapItemCompleted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_2', tool: 'spawnAgent',
+				status: 'completed', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1'],
+				prompt: 'Investigate the failing test', model: 'gpt-5.5',
+				reasoningEffort: null,
+				agentsStates: { sub_1: { status: 'completed', message: 'Found the bug in foo.ts' } },
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
+		});
+		assert.deepStrictEqual({ actions, remainingToolCalls: state.itemToToolCall.size }, {
+			actions: [{
+				type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId,
+				result: {
+					success: true,
+					pastTenseMessage: 'Spawned agent',
+					content: [{ type: ToolResultContentType.Text, text: 'Completed — Found the bug in foo.ts' }],
+				},
+			}],
+			remainingToolCalls: 0,
+		});
+	});
+
+	test('collabAgentToolCall wait aggregates results from multiple subagents', () => {
+		const state = createCodexSessionMapState();
+		mapItemStarted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_wait', tool: 'wait',
+				status: 'inProgress', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1', 'sub_2'],
+				prompt: null, model: null, reasoningEffort: null, agentsStates: {},
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const toolCallId = state.itemToToolCall.get('collab_wait')!.toolCallId;
+		const actions = mapItemCompleted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_wait', tool: 'wait',
+				status: 'completed', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1', 'sub_2'],
+				prompt: null, model: null, reasoningEffort: null,
+				agentsStates: {
+					sub_1: { status: 'completed', message: 'Migration finished' },
+					sub_2: { status: 'running', message: 'Still analysing' },
+				},
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
+		});
+		assert.deepStrictEqual(actions, [{
+			type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId,
+			result: {
+				success: true,
+				pastTenseMessage: 'Finished waiting',
+				content: [{ type: ToolResultContentType.Text, text: 'Agent 1: Completed — Migration finished\nAgent 2: Running — Still analysing' }],
+			},
+		}]);
+	});
+
+	test('collabAgentToolCall failure reports the errored subagent state', () => {
+		const state = createCodexSessionMapState();
+		mapItemStarted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_fail', tool: 'spawnAgent',
+				status: 'inProgress', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1'],
+				prompt: 'Refactor the parser', model: 'gpt-5.5', reasoningEffort: null, agentsStates: {},
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const toolCallId = state.itemToToolCall.get('collab_fail')!.toolCallId;
+		const actions = mapItemCompleted(state, {
+			item: {
+				type: 'collabAgentToolCall', id: 'collab_fail', tool: 'spawnAgent',
+				status: 'failed', senderThreadId: 'thr_1', receiverThreadIds: ['sub_1'],
+				prompt: 'Refactor the parser', model: 'gpt-5.5', reasoningEffort: null,
+				agentsStates: { sub_1: { status: 'errored', message: 'Model unavailable' } },
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
+		});
+		assert.deepStrictEqual(actions, [{
+			type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId,
+			result: {
+				success: false,
+				pastTenseMessage: 'Spawn agent failed',
+				content: [{ type: ToolResultContentType.Text, text: 'Errored — Model unavailable' }],
+				error: { message: 'Collab agent failed' },
+			},
+		}]);
 	});
 
 	test('dynamicToolCall item carries a Client contributor when a client owns the tool', () => {

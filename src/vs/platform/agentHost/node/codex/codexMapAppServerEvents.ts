@@ -10,6 +10,7 @@ import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallCont
 import { extractForwardedErrorInfo } from '../shared/forwardedChatError.js';
 import { getServerToolDisplay } from '../shared/serverToolGroups.js';
 import { ActiveClientToolSet } from '../activeClientState.js';
+import { unwrapShellInvocation } from './codexShellCommand.js';
 import type { AgentMessageDeltaNotification } from './protocol/generated/v2/AgentMessageDeltaNotification.js';
 import type { CommandExecutionOutputDeltaNotification } from './protocol/generated/v2/CommandExecutionOutputDeltaNotification.js';
 import type { FileChangeOutputDeltaNotification } from './protocol/generated/v2/FileChangeOutputDeltaNotification.js';
@@ -29,6 +30,8 @@ import type { UserInput } from './protocol/generated/v2/UserInput.js';
 import type { WebSearchAction } from './protocol/generated/v2/WebSearchAction.js';
 import type { DynamicToolCallOutputContentItem } from './protocol/generated/v2/DynamicToolCallOutputContentItem.js';
 import type { JsonValue } from './protocol/generated/serde_json/JsonValue.js';
+import type { CollabAgentTool } from './protocol/generated/v2/CollabAgentTool.js';
+import type { CollabAgentState } from './protocol/generated/v2/CollabAgentState.js';
 
 /**
  * Per-session mutable state held by the mapper. Carries the bookkeeping
@@ -204,6 +207,71 @@ function mcpToolOutput(result: McpToolCallResult | null, errorMessage?: string):
 }
 
 /**
+ * Human labels for a Codex collab-agent (subagent) tool call, mirroring the
+ * reference client's phrasing. Codex surfaces subagent orchestration as
+ * `collabAgentToolCall` items on the parent thread — there is no separate
+ * child-thread event stream — so each collab tool call renders as a tool
+ * call in the parent chat.
+ */
+function collabAgentToolLabels(tool: CollabAgentTool): { readonly displayName: string; readonly present: string; readonly past: string } {
+	switch (tool) {
+		case 'spawnAgent': return { displayName: 'Spawn agent', present: 'Spawning agent', past: 'Spawned agent' };
+		case 'sendInput': return { displayName: 'Send input to agent', present: 'Sending input to agent', past: 'Sent input to agent' };
+		case 'resumeAgent': return { displayName: 'Resume agent', present: 'Resuming agent', past: 'Resumed agent' };
+		case 'wait': return { displayName: 'Wait for agents', present: 'Waiting for agents', past: 'Finished waiting' };
+		case 'closeAgent': return { displayName: 'Close agent', present: 'Closing agent', past: 'Closed agent' };
+		default: return { displayName: tool, present: tool, past: tool };
+	}
+}
+
+/** One-line summary of a spawned agent's state — the subagent's result. */
+function collabAgentStateSummary(state: CollabAgentState): string {
+	switch (state.status) {
+		case 'completed': return state.message ? `Completed — ${state.message}` : 'Completed';
+		case 'errored': return state.message ? `Errored — ${state.message}` : 'Errored';
+		case 'running': return state.message ? `Running — ${state.message}` : 'Running';
+		case 'interrupted': return state.message ? `Interrupted — ${state.message}` : 'Interrupted';
+		case 'pendingInit': return 'Pending init';
+		case 'shutdown': return 'Shutdown';
+		case 'notFound': return 'Not found';
+		default: return state.status;
+	}
+}
+
+/**
+ * Render the per-agent result block for a completed collab tool call. Prefers
+ * the receiver order, then appends any other agents present in `agentsStates`.
+ * The completed message carries the subagent's actual output.
+ */
+function collabAgentResultOutput(receiverThreadIds: readonly string[], agentsStates: { readonly [key: string]: CollabAgentState | undefined }): string {
+	const seen = new Set<string>();
+	const states: CollabAgentState[] = [];
+	for (const id of receiverThreadIds) {
+		const state = agentsStates[id];
+		if (state) {
+			states.push(state);
+			seen.add(id);
+		}
+	}
+	for (const id of Object.keys(agentsStates).sort()) {
+		if (seen.has(id)) {
+			continue;
+		}
+		const state = agentsStates[id];
+		if (state) {
+			states.push(state);
+		}
+	}
+	if (states.length === 0) {
+		return '';
+	}
+	if (states.length === 1) {
+		return collabAgentStateSummary(states[0]);
+	}
+	return states.map((state, index) => `Agent ${index + 1}: ${collabAgentStateSummary(state)}`).join('\n');
+}
+
+/**
  * Translate `turn/started` into a `ChatTurnStarted` action.
  *
  * Codex's `turn/started.turn.items[0]` SHOULD be the userMessage that
@@ -329,7 +397,7 @@ export function mapItemStarted(
 			toolName: 'shell',
 			output: '',
 		});
-		const command = params.item.command ?? '';
+		const command = unwrapShellInvocation(params.item.command ?? '');
 		return [
 			{
 				type: ActionType.ChatToolCallStart,
@@ -515,6 +583,48 @@ export function mapItemStarted(
 			} satisfies SessionAction | ChatAction] : []),
 		];
 	}
+	if (params.item.type === 'collabAgentToolCall') {
+		const toolCallId = generateUuid();
+		const labels = collabAgentToolLabels(params.item.tool);
+		const toolName = `codex.${params.item.tool}`;
+		const inputParts: string[] = [];
+		if (params.item.prompt) {
+			inputParts.push(params.item.prompt);
+		}
+		if (params.item.model) {
+			inputParts.push(`Model: ${params.item.model}`);
+		}
+		const toolInput = inputParts.join('\n\n');
+		state.itemToToolCall.set(params.item.id, {
+			toolCallId,
+			turnId: params.turnId,
+			toolName,
+			output: '',
+		});
+		return [
+			{
+				type: ActionType.ChatToolCallStart,
+				turnId: params.turnId,
+				toolCallId,
+				toolName,
+				displayName: labels.displayName,
+			},
+			...(toolInput ? [{
+				type: ActionType.ChatToolCallDelta,
+				turnId: params.turnId,
+				toolCallId,
+				content: toolInput,
+			} satisfies SessionAction | ChatAction] : []),
+			{
+				type: ActionType.ChatToolCallReady,
+				turnId: params.turnId,
+				toolCallId,
+				invocationMessage: labels.present,
+				toolInput,
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			},
+		];
+	}
 	return [];
 }
 
@@ -644,7 +754,7 @@ export function mapItemCompleted(
 	if (params.item.type === 'commandExecution') {
 		const success = params.item.status === 'completed' && (params.item.exitCode === 0 || params.item.exitCode === null);
 		const output = params.item.aggregatedOutput ?? entry.output;
-		const command = params.item.command ?? '';
+		const command = unwrapShellInvocation(params.item.command ?? '');
 		const exit = params.item.exitCode;
 		const pastTense = success
 			? `Ran \`${command}\``
@@ -729,6 +839,23 @@ export function mapItemCompleted(
 				pastTenseMessage: serverPastTense ?? (success ? `Called ${entry.toolName}` : `Failed to call ${entry.toolName}`),
 				content,
 				...(success ? {} : { error: { message: `Dynamic tool ${params.item.status}`, ...(declined ? { code: 'denied' } : {}) } }),
+			},
+		}];
+	}
+	if (params.item.type === 'collabAgentToolCall') {
+		const labels = collabAgentToolLabels(params.item.tool);
+		const success = params.item.status === 'completed';
+		const output = collabAgentResultOutput(params.item.receiverThreadIds, params.item.agentsStates) || entry.output;
+		const content = output ? [{ type: ToolResultContentType.Text as const, text: output }] : undefined;
+		return [{
+			type: ActionType.ChatToolCallComplete,
+			turnId: entry.turnId,
+			toolCallId: entry.toolCallId,
+			result: {
+				success,
+				pastTenseMessage: success ? labels.past : `${labels.displayName} failed`,
+				content,
+				...(success ? {} : { error: { message: `Collab agent ${params.item.status}`, ...(declined ? { code: 'denied' } : {}) } }),
 			},
 		}];
 	}

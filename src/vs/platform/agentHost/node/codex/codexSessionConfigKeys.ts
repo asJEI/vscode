@@ -7,22 +7,14 @@ import type { ReasoningEffort } from './protocol/generated/ReasoningEffort.js';
 import type { ReasoningSummary } from './protocol/generated/ReasoningSummary.js';
 import type { Personality } from './protocol/generated/Personality.js';
 import type { WebSearchMode } from './protocol/generated/WebSearchMode.js';
-import type { AskForApproval } from './protocol/generated/v2/AskForApproval.js';
 import type { ModeKind } from './protocol/generated/ModeKind.js';
 import type { SandboxMode } from './protocol/generated/v2/SandboxMode.js';
+import { CodexSessionConfigKey, narrowCodexPermissionsPreset, resolveCodexPermissionsPreset, type CodexApprovalPolicy, type ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
 
-export const enum CodexSessionConfigKey {
-	ApprovalPolicy = 'codex.approvalPolicy',
-	SandboxMode = 'codex.sandboxMode',
-	AdditionalDirectories = 'codex.additionalDirectories',
-	NetworkAccessEnabled = 'codex.networkAccessEnabled',
-	WebSearchMode = 'codex.webSearchMode',
-	ModelReasoningEffort = 'codex.modelReasoningEffort',
-	Personality = 'codex.personality',
-	ReasoningSummary = 'codex.reasoningSummary',
-}
-
-export type CodexApprovalPolicy = Extract<AskForApproval, 'never' | 'on-request' | 'on-failure' | 'untrusted'>;
+// Re-export the shared, protocol-free config-key surface so node callers can
+// keep importing everything from this module.
+export { CodexSessionConfigKey, resolveCodexPermissionsPreset, narrowCodexPermissionsPreset, CODEX_PERMISSIONS_PRESETS, CODEX_DEFAULT_PERMISSIONS_PRESET } from '../../common/codexSessionConfigKeys.js';
+export type { CodexApprovalPolicy, CodexPermissionsPreset, CodexSandboxMode, CodexApprovalsReviewer, ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
 
 export function narrowApprovalPolicy(value: unknown): CodexApprovalPolicy | undefined {
 	switch (value) {
@@ -45,6 +37,31 @@ export function narrowSandboxMode(value: unknown): SandboxMode | undefined {
 		default:
 			return undefined;
 	}
+}
+
+/**
+ * Resolve the Codex security axes (approval policy, sandbox, approvals
+ * reviewer) for a session's stored config values.
+ *
+ * The user-facing {@link CodexSessionConfigKey.PermissionsPreset} is the source
+ * of truth; when present it expands into all three axes. For backward
+ * compatibility (older sessions / programmatic config) we fall back to the
+ * individual {@link CodexSessionConfigKey.ApprovalPolicy} /
+ * {@link CodexSessionConfigKey.SandboxMode} keys with a `user` reviewer.
+ */
+export function resolveCodexPermissions(
+	values: Record<string, unknown> | undefined,
+	defaults: { approvalPolicy: CodexApprovalPolicy; sandboxMode: SandboxMode },
+): ICodexResolvedPermissions {
+	const preset = narrowCodexPermissionsPreset(values?.[CodexSessionConfigKey.PermissionsPreset]);
+	if (preset) {
+		return resolveCodexPermissionsPreset(preset);
+	}
+	return {
+		approvalPolicy: narrowApprovalPolicy(values?.[CodexSessionConfigKey.ApprovalPolicy]) ?? defaults.approvalPolicy,
+		sandboxMode: narrowSandboxMode(values?.[CodexSessionConfigKey.SandboxMode]) ?? defaults.sandboxMode,
+		approvalsReviewer: 'user',
+	};
 }
 
 export function narrowAdditionalDirectories(value: unknown): readonly string[] | undefined {
