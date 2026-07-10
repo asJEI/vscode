@@ -44,11 +44,12 @@ import { CodexAppServerClient, JsonRpcError, transportFromChildProcess, type ICo
 import { ICodexProxyService, type ICodexProxyHandle } from './codexProxyService.js';
 import { createCodexSessionMapState, extractUserInputText, mapAgentMessageDelta, mapCommandExecutionOutputDelta, mapFileChangeOutputDelta, mapFileChangePatchUpdated, mapItemCompleted, mapItemStarted, mapMcpToolCallProgress, mapReasoningSummaryPartAdded, mapReasoningSummaryTextDelta, mapReasoningTextDelta, mapTokenUsageUpdated, mapTurnCompleted, mapTurnStarted, resetCodexTurnMapState, type ICodexSessionMapState } from './codexMapAppServerEvents.js';
 import { unwrapShellInvocation } from './codexShellCommand.js';
+import { planForkedTurnIdMap, resolveForkBoundary } from './codexForkPlan.js';
 import { resolveCodexInput } from './codexPromptResolver.js';
 import { buildUserInputRequest, emptyUserInputResponse, userInputResponseFromAnswers } from './codexUserInputMapper.js';
 import { replayThreadToTurns } from './codexReplayMapper.js';
 import { CodexSessionMetadataStore } from './codexSessionMetadataStore.js';
-import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, CODEX_PERMISSIONS_PRESETS, collaborationModeKind, narrowAdditionalDirectories, narrowBoolean, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowWebSearchMode, resolveCodexPermissions, type CodexApprovalPolicy, type CodexPermissionsPreset } from './codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, CODEX_PERMISSIONS_PRESETS, collaborationModeKind, narrowAdditionalDirectories, narrowBoolean, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowWebSearchMode, resolveCodexPermissions, type CodexApprovalPolicy, type CodexPermissionsPreset, type ICodexResolvedPermissions } from './codexSessionConfigKeys.js';
 import type { ReasoningEffort } from './protocol/generated/ReasoningEffort.js';
 import type { ReasoningSummary } from './protocol/generated/ReasoningSummary.js';
 import type { Personality } from './protocol/generated/Personality.js';
@@ -778,6 +779,27 @@ export class CodexAgent extends Disposable implements IAgent {
 		);
 	}
 
+	/**
+	 * Resolve the Codex security axes (approval policy, sandbox, reviewer) for a
+	 * live or restored session from its RAW persisted config values.
+	 *
+	 * Reading the raw values (rather than {@link _readSessionConfig}, which runs
+	 * `validateOrDefault`) is important: `validateOrDefault` always materializes
+	 * the default {@link CodexSessionConfigKey.PermissionsPreset}, which would
+	 * shadow a legacy session that persisted only the individual `sandboxMode` /
+	 * `approvalPolicy` axes — silently escalating e.g. a `read-only` session back
+	 * to `workspace-write` on resume. Using the raw values lets
+	 * {@link resolveCodexPermissions} honor those legacy axes when no explicit
+	 * preset was ever chosen.
+	 */
+	private _resolveSessionPermissions(session: ICodexSession): ICodexResolvedPermissions {
+		const rawValues = this._configurationService.getSessionConfigValues(session.sessionUri.toString());
+		return resolveCodexPermissions(rawValues, {
+			approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
+			sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
+		});
+	}
+
 	private _sandboxPolicy(session: ICodexSession, config: ReturnType<typeof codexSessionConfigSchema.validateOrDefault>, mode: SandboxMode): SandboxPolicy {
 		if (mode === 'danger-full-access') {
 			return { type: 'dangerFullAccess' };
@@ -801,10 +823,7 @@ export class CodexAgent extends Disposable implements IAgent {
 
 	private _turnStartOptions(session: ICodexSession, modelId: string): Pick<TurnStartParams, 'approvalPolicy' | 'sandboxPolicy' | 'approvalsReviewer' | 'effort' | 'runtimeWorkspaceRoots' | 'personality' | 'summary' | 'collaborationMode'> {
 		const config = this._readSessionConfig(session);
-		const { approvalPolicy, sandboxMode, approvalsReviewer } = resolveCodexPermissions(config, {
-			approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
-			sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
-		});
+		const { approvalPolicy, sandboxMode, approvalsReviewer } = this._resolveSessionPermissions(session);
 		const sandboxPolicy = this._sandboxPolicy(session, config, sandboxMode);
 		const runtimeWorkspaceRoots = sandboxPolicy.type === 'workspaceWrite' ? sandboxPolicy.writableRoots : undefined;
 		const effort = this._getReasoningEffort(session);
@@ -2038,20 +2057,30 @@ export class CodexAgent extends Disposable implements IAgent {
 		// caller-supplied `turnIndex` when the id can't be resolved.
 		const sourceSession = this._sessions.get(AgentSession.id(fork.session));
 		const codexTurnId = sourceSession?.codexTurnIdByHostTurnId.get(fork.turnId) ?? fork.turnId;
-		let keepThroughIndex = sourceTurns.findIndex(t => t.id === codexTurnId);
-		if (keepThroughIndex === -1) {
-			keepThroughIndex = fork.turnIndex;
+		// Reject an unresolvable fork boundary rather than silently keeping the
+		// full history: if neither the mapped codex turn id nor the caller's
+		// `turnIndex` lands inside the source turns, a `numTurnsToDrop` of 0 would
+		// branch from the wrong point (the tip instead of the requested turn).
+		const boundary = resolveForkBoundary(sourceTurns.map(t => t.id), codexTurnId, fork.turnIndex);
+		if (!boundary.resolved) {
+			throw new Error(`Cannot fork codex session ${sourceThreadId}: unable to resolve fork boundary for turn ${fork.turnId} (turnIndex=${fork.turnIndex}, turns=${sourceTurns.length})`);
 		}
-		const numTurnsToDrop = sourceTurns.length > 0 && keepThroughIndex >= 0
-			? Math.max(0, sourceTurns.length - (keepThroughIndex + 1))
-			: 0;
+		const { keepThroughIndex, numTurnsToDrop } = boundary;
 
 		const conn = await this._ensureConnection();
 		const model = this._supportedModelOrUndefined(config.model);
-		const { approvalPolicy, sandboxMode, approvalsReviewer } = resolveCodexPermissions(config.config, {
-			approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
-			sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
-		});
+		// Inherit the source session's effective permissions so forking an
+		// auto-review / full-access / read-only session doesn't silently reset the
+		// fork back to the Default preset. Fork callers typically pass an empty
+		// `config.config`; any explicit override there still wins.
+		const sourceConfigValues = this._configurationService.getSessionConfigValues(fork.session.toString());
+		const { approvalPolicy, sandboxMode, approvalsReviewer } = resolveCodexPermissions(
+			{ ...sourceConfigValues, ...config.config },
+			{
+				approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
+				sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
+			},
+		);
 		const forkResult = await conn.client.request<'thread/fork', ThreadForkResponse>('thread/fork', {
 			threadId: sourceThreadId,
 			...(model ? { model: model.id } : {}),
@@ -2098,6 +2127,32 @@ export class CodexAgent extends Disposable implements IAgent {
 			this._serverToolHost.advertise(session.sessionUri.toString());
 		}
 		this._persistMaterializedSession(session);
+
+		// Seed the host→codex turn-id map for the copied turns so a later
+		// edit/truncate of an inherited turn can resolve its app-server turn id.
+		// Without this, `truncateSession` can't map the host id and skips the
+		// rollback. `thread/fork` may regenerate turn ids, so read the forked
+		// thread's authoritative kept turns and pair them, in order, with the new
+		// host turn ids from `fork.turnIdMapping`. Best-effort: a failed read just
+		// leaves the map unseeded (same as before), never blocking the fork.
+		if (fork.turnIdMapping && fork.turnIdMapping.size > 0) {
+			try {
+				const forkedRead = await this._readSession(newSessionUri);
+				const forkedTurns = forkedRead?.thread.turns ?? [];
+				const entries = planForkedTurnIdMap(
+					sourceTurns.map(t => t.id),
+					forkedTurns.map(t => t.id),
+					keepThroughIndex,
+					sourceSession?.hostTurnIdByAppTurnId,
+					fork.turnIdMapping,
+				);
+				for (const [hostTurnId, forkedCodexTurnId] of entries) {
+					session.codexTurnIdByHostTurnId.set(hostTurnId, forkedCodexTurnId);
+				}
+			} catch (err) {
+				this._logService.warn(`[Codex:${newThreadId}] failed to seed forked turn-id map: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
 
 		this._logService.info(`[Codex] forked session ${sourceThreadId} → ${newThreadId} (kept ${sourceTurns.length - numTurnsToDrop}/${sourceTurns.length} turns)`);
 		return {
@@ -2155,10 +2210,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		const conn = await this._ensureConnection();
 		const config = this._readSessionConfig(session);
 		const model = await this._resolveModel(session);
-		const { approvalPolicy, sandboxMode, approvalsReviewer } = resolveCodexPermissions(config, {
-			approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
-			sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
-		});
+		const { approvalPolicy, sandboxMode, approvalsReviewer } = this._resolveSessionPermissions(session);
 		const startResult = await conn.client.request<'thread/start', { thread: { id: string } }>('thread/start', {
 			cwd: session.workingDirectory.fsPath,
 			model: model.id,
