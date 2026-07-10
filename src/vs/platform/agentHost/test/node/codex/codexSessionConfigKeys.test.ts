@@ -6,7 +6,7 @@
 import assert from 'assert';
 import type { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { CodexSessionConfigKey, collaborationModeKind, narrowAdditionalDirectories, narrowApprovalPolicy, narrowBoolean, narrowCodexPermissionsPreset, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowSandboxMode, narrowWebSearchMode, resolveCodexPermissions, resolveCodexPermissionsPreset } from '../../../node/codex/codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, collaborationModeKind, migrateCodexPermissionValues, narrowAdditionalDirectories, narrowApprovalPolicy, narrowBoolean, narrowCodexPermissionsPreset, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowSandboxMode, narrowWebSearchMode, presetForResolvedPermissions, resolveCodexPermissions, resolveCodexPermissionsPreset } from '../../../node/codex/codexSessionConfigKeys.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
@@ -109,6 +109,78 @@ suite('codexSessionConfigKeys', () => {
 			modeEnum: ['interactive', 'plan'],
 			defaultedValues: { mode: 'interactive', preset: 'default' },
 			fullAccessPreset: 'full-access',
+		});
+	});
+
+	test('inverts presets and migrates legacy axes without escalating', () => {
+		const defaults = { approvalPolicy: 'on-request' as const, sandboxMode: 'workspace-write' as const };
+		assert.deepStrictEqual({
+			// Every preset round-trips through expand → invert; a `read-only`
+			// sandbox is not representable by any preset.
+			invert: {
+				default: presetForResolvedPermissions(resolveCodexPermissionsPreset('default')),
+				autoReview: presetForResolvedPermissions(resolveCodexPermissionsPreset('auto-review')),
+				fullAccess: presetForResolvedPermissions(resolveCodexPermissionsPreset('full-access')),
+				readOnly: presetForResolvedPermissions({ approvalPolicy: 'on-request', sandboxMode: 'read-only', approvalsReviewer: 'user' }),
+			},
+			// An explicit preset is kept verbatim.
+			explicit: migrateCodexPermissionValues({ [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' }, defaults),
+			// Legacy axes equal to a preset are migrated to it (raw axes dropped).
+			migrated: migrateCodexPermissionValues({ [CodexSessionConfigKey.SandboxMode]: 'workspace-write', [CodexSessionConfigKey.ApprovalPolicy]: 'on-request' }, defaults),
+			// Legacy `read-only` axes are preserved verbatim with NO preset — the
+			// escalation the reviewer flagged.
+			preserved: migrateCodexPermissionValues({ [CodexSessionConfigKey.SandboxMode]: 'read-only' }, defaults),
+			// Empty config resolves to the default preset.
+			empty: migrateCodexPermissionValues(undefined, defaults),
+		}, {
+			invert: { default: 'default', autoReview: 'auto-review', fullAccess: 'full-access', readOnly: undefined },
+			explicit: { [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' },
+			migrated: { [CodexSessionConfigKey.PermissionsPreset]: 'default' },
+			preserved: { [CodexSessionConfigKey.ApprovalPolicy]: 'on-request', [CodexSessionConfigKey.SandboxMode]: 'read-only' },
+			empty: { [CodexSessionConfigKey.PermissionsPreset]: 'default' },
+		});
+	});
+
+	test('resolveSessionConfig preserves legacy read-only permissions on restore', async () => {
+		const agent = createAgent(disposables);
+		const legacyDefaults = { approvalPolicy: 'on-request' as const, sandboxMode: 'workspace-write' as const };
+
+		// A pre-preset session persisted only the individual axes (read-only)
+		// plus an unrelated non-permission setting.
+		const legacy = await agent.resolveSessionConfig({
+			config: {
+				[CodexSessionConfigKey.SandboxMode]: 'read-only',
+				[CodexSessionConfigKey.ApprovalPolicy]: 'on-request',
+				[CodexSessionConfigKey.ModelReasoningEffort]: 'high',
+			},
+		});
+		// A legacy session whose axes map exactly onto a preset is migrated to it.
+		const migratable = await agent.resolveSessionConfig({
+			config: {
+				[CodexSessionConfigKey.SandboxMode]: 'danger-full-access',
+				[CodexSessionConfigKey.ApprovalPolicy]: 'never',
+			},
+		});
+
+		assert.deepStrictEqual({
+			// read-only has no equivalent preset: axes preserved, NO preset
+			// inserted, and the effective permissions stay read-only.
+			legacyPreset: legacy.values[CodexSessionConfigKey.PermissionsPreset],
+			legacySandbox: legacy.values[CodexSessionConfigKey.SandboxMode],
+			legacyEffective: resolveCodexPermissions(legacy.values, legacyDefaults),
+			// Non-permission settings survive the restore round-trip.
+			legacyEffort: legacy.values[CodexSessionConfigKey.ModelReasoningEffort],
+			// danger-full-access + never == the full-access preset: migrated, raw
+			// axes dropped.
+			migratablePreset: migratable.values[CodexSessionConfigKey.PermissionsPreset],
+			migratableSandbox: migratable.values[CodexSessionConfigKey.SandboxMode],
+		}, {
+			legacyPreset: undefined,
+			legacySandbox: 'read-only',
+			legacyEffective: { approvalPolicy: 'on-request', sandboxMode: 'read-only', approvalsReviewer: 'user' },
+			legacyEffort: 'high',
+			migratablePreset: 'full-access',
+			migratableSandbox: undefined,
 		});
 	});
 });

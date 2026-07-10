@@ -9,11 +9,11 @@ import type { Personality } from './protocol/generated/Personality.js';
 import type { WebSearchMode } from './protocol/generated/WebSearchMode.js';
 import type { ModeKind } from './protocol/generated/ModeKind.js';
 import type { SandboxMode } from './protocol/generated/v2/SandboxMode.js';
-import { CodexSessionConfigKey, narrowCodexPermissionsPreset, resolveCodexPermissionsPreset, type CodexApprovalPolicy, type ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, narrowCodexPermissionsPreset, presetForResolvedPermissions, resolveCodexPermissionsPreset, type CodexApprovalPolicy, type ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
 
 // Re-export the shared, protocol-free config-key surface so node callers can
 // keep importing everything from this module.
-export { CodexSessionConfigKey, resolveCodexPermissionsPreset, narrowCodexPermissionsPreset, CODEX_PERMISSIONS_PRESETS, CODEX_DEFAULT_PERMISSIONS_PRESET } from '../../common/codexSessionConfigKeys.js';
+export { CodexSessionConfigKey, resolveCodexPermissionsPreset, presetForResolvedPermissions, narrowCodexPermissionsPreset, CODEX_PERMISSIONS_PRESETS, CODEX_DEFAULT_PERMISSIONS_PRESET } from '../../common/codexSessionConfigKeys.js';
 export type { CodexApprovalPolicy, CodexPermissionsPreset, CodexSandboxMode, CodexApprovalsReviewer, ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
 
 export function narrowApprovalPolicy(value: unknown): CodexApprovalPolicy | undefined {
@@ -61,6 +61,46 @@ export function resolveCodexPermissions(
 		approvalPolicy: narrowApprovalPolicy(values?.[CodexSessionConfigKey.ApprovalPolicy]) ?? defaults.approvalPolicy,
 		sandboxMode: narrowSandboxMode(values?.[CodexSessionConfigKey.SandboxMode]) ?? defaults.sandboxMode,
 		approvalsReviewer: 'user',
+	};
+}
+
+/**
+ * Decide how a restored session's three permission keys (`permissionsPreset`,
+ * `approvalPolicy`, `sandboxMode`) should be represented, given its raw
+ * persisted config values.
+ *
+ * This exists to prevent a silent privilege escalation on restore: a legacy
+ * session that persisted only the individual axes (for example
+ * `sandboxMode = 'read-only'`) and never chose a preset must not have a
+ * materialized `permissionsPreset = 'default'` inserted on top of it, because
+ * {@link resolveCodexPermissions} checks the preset first and would resume the
+ * session as `workspace-write`.
+ *
+ * The returned object contains ONLY the permission keys that should be present
+ * afterwards, so callers should drop all three permission keys before applying
+ * it:
+ * - an explicitly chosen preset is kept as-is;
+ * - legacy axes that map exactly onto a preset are migrated to that preset
+ *   (single source of truth) and the raw axes dropped;
+ * - legacy axes with no equivalent preset (e.g. `read-only`) are preserved
+ *   verbatim and no preset is surfaced, so the legacy fallback keeps applying.
+ */
+export function migrateCodexPermissionValues(
+	config: Record<string, unknown> | undefined,
+	defaults: { approvalPolicy: CodexApprovalPolicy; sandboxMode: SandboxMode },
+): Record<string, string> {
+	const explicitPreset = narrowCodexPermissionsPreset(config?.[CodexSessionConfigKey.PermissionsPreset]);
+	if (explicitPreset) {
+		return { [CodexSessionConfigKey.PermissionsPreset]: explicitPreset };
+	}
+	const resolved = resolveCodexPermissions(config, defaults);
+	const equivalentPreset = presetForResolvedPermissions(resolved);
+	if (equivalentPreset) {
+		return { [CodexSessionConfigKey.PermissionsPreset]: equivalentPreset };
+	}
+	return {
+		[CodexSessionConfigKey.ApprovalPolicy]: resolved.approvalPolicy,
+		[CodexSessionConfigKey.SandboxMode]: resolved.sandboxMode,
 	};
 }
 

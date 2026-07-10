@@ -49,7 +49,7 @@ import { resolveCodexInput } from './codexPromptResolver.js';
 import { buildUserInputRequest, emptyUserInputResponse, userInputResponseFromAnswers } from './codexUserInputMapper.js';
 import { replayThreadToTurns } from './codexReplayMapper.js';
 import { CodexSessionMetadataStore } from './codexSessionMetadataStore.js';
-import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, CODEX_PERMISSIONS_PRESETS, collaborationModeKind, narrowAdditionalDirectories, narrowBoolean, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowWebSearchMode, resolveCodexPermissions, type CodexApprovalPolicy, type CodexPermissionsPreset, type ICodexResolvedPermissions } from './codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, CODEX_PERMISSIONS_PRESETS, collaborationModeKind, migrateCodexPermissionValues, narrowAdditionalDirectories, narrowBoolean, narrowPersonality, narrowReasoningEffort, narrowReasoningSummary, narrowWebSearchMode, resolveCodexPermissions, type CodexApprovalPolicy, type CodexPermissionsPreset, type ICodexResolvedPermissions } from './codexSessionConfigKeys.js';
 import type { ReasoningEffort } from './protocol/generated/ReasoningEffort.js';
 import type { ReasoningSummary } from './protocol/generated/ReasoningSummary.js';
 import type { Personality } from './protocol/generated/Personality.js';
@@ -3156,10 +3156,29 @@ export class CodexAgent extends Disposable implements IAgent {
 	resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
 		const values = codexSessionConfigSchema.validateOrDefault(params.config, codexSessionConfigDefaults);
 		const schema = codexVisibleSessionConfigSchema.toProtocol();
+		// Preserve every value the caller previously persisted. This return
+		// REPLACES the stored session config on restore (see
+		// `AgentService._resolveCreatedSessionConfig`), so cherry-picking only
+		// the visible keys here would reset all the others (reasoning effort,
+		// personality, sandbox axes, …) back to their defaults on resume.
 		const resolvedValues: Record<string, unknown> = {
+			...params.config,
 			[SessionConfigKey.Mode]: values[SessionConfigKey.Mode],
-			[CodexSessionConfigKey.PermissionsPreset]: values[CodexSessionConfigKey.PermissionsPreset],
 		};
+		// Migrate the permission axes off the raw config. `validateOrDefault`
+		// always materializes `permissionsPreset='default'`, but blindly storing
+		// that would silently escalate a legacy session that persisted only the
+		// individual `sandboxMode`/`approvalPolicy` axes (e.g. `read-only`) —
+		// `resolveCodexPermissions` checks the preset first. Drop all three
+		// permission keys, then re-apply only the ones the migration decides are
+		// safe (an explicit or exactly-equivalent preset, else the raw axes).
+		delete resolvedValues[CodexSessionConfigKey.PermissionsPreset];
+		delete resolvedValues[CodexSessionConfigKey.ApprovalPolicy];
+		delete resolvedValues[CodexSessionConfigKey.SandboxMode];
+		Object.assign(resolvedValues, migrateCodexPermissionValues(params.config, {
+			approvalPolicy: codexSessionConfigDefaults[CodexSessionConfigKey.ApprovalPolicy],
+			sandboxMode: codexSessionConfigDefaults[CodexSessionConfigKey.SandboxMode],
+		}));
 		return Promise.resolve({ values: resolvedValues, schema });
 	}
 

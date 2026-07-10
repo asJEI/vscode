@@ -91,3 +91,24 @@ export function resolveCodexPermissionsPreset(preset: CodexPermissionsPreset): I
 			return { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'user' };
 	}
 }
+
+/**
+ * Inverse of {@link resolveCodexPermissionsPreset}: find the preset whose
+ * expanded axes exactly match the given resolved permissions, or `undefined`
+ * when no preset can represent them (e.g. a `read-only` sandbox, which no
+ * preset expands to).
+ *
+ * Used when restoring a legacy session that persisted the individual security
+ * axes but no preset: if the axes map cleanly onto a preset we can migrate them
+ * to the modern single-preset representation; otherwise the raw axes must be
+ * preserved so they are not silently escalated.
+ */
+export function presetForResolvedPermissions(resolved: ICodexResolvedPermissions): CodexPermissionsPreset | undefined {
+	for (const preset of CODEX_PERMISSIONS_PRESETS) {
+		const axes = resolveCodexPermissionsPreset(preset);
+		if (axes.approvalPolicy === resolved.approvalPolicy && axes.sandboxMode === resolved.sandboxMode && axes.approvalsReviewer === resolved.approvalsReviewer) {
+			return preset;
+		}
+	}
+	return undefined;
+}
